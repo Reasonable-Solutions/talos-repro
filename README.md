@@ -12,7 +12,7 @@ a real Linux kernel in a small NixOS VM.
 
 Pinned source: **Talos 1.14.1**, commit
 [`2f86b9d2a29b413deddd7122a8420b8913813615`](https://github.com/siderolabs/talos/tree/2f86b9d2a29b413deddd7122a8420b8913813615).
-The flake pins the source archive, vendored dependencies, Go **1.26.5**, and the
+The flake pins the unpacked source tree, vendored dependencies, Go **1.26.5**, and the
 NixOS test environment. Other Talos versions have not been evaluated here.
 
 ## Why we are fixing this
@@ -34,11 +34,13 @@ helper; it does not parse BGP updates or apply the GoBGP patch.
 
 ## What goes wrong
 
-The common [regression test](route_regression_test.go) covers six cases:
+The common [regression test](route_regression_test.go) covers eight cases:
 
 | Case | Expected behavior | Stock pinned Talos |
 | --- | --- | --- |
-| RA control | RA at metric 1024 and a manually assigned BGP metric 100 coexist | Passes |
+| RA control | The stock controller installs a BGP spec explicitly set to metric 100 beside RA at 1024 | Passes |
+| IPv4 metric control | Learned IPv4 BGP routes keep metric zero | Passes |
+| IPv4 link move | A running IPv4 route moves between links while retaining its RouteID | Passes |
 | BGP beside RA | A learned BGP default coexists with an RA default on the other link | `EEXIST` |
 | Next-hop replacement | Remove a withdrawn next-hop before adding its replacement, regardless of resource order | `EEXIST` |
 | Interface ownership | Cleanup on one interface preserves a route through the same link-local gateway on another | Deletes the other interface's route |
@@ -69,20 +71,33 @@ and runs before and after applying the patch**.
 
 The patch:
 
-1. Assigns learned BGP routes metric **100**, keeping them distinct from RA
-   defaults at 1024 and preferring BGP while preserving RA fallback.
+1. Assigns learned **IPv6** BGP routes metric **100**, keeping them distinct from
+   RA defaults at 1024 and preferring BGP while preserving RA fallback. IPv4
+   BGP routes retain metric zero.
 2. Processes withdrawals before additions and refreshes the kernel snapshot
    between those phases. A replacement cannot be mistaken for, or collide with,
    a route that should have been removed in the same pass.
-3. Includes the requested output interface in route matching. Cleanup for a
-   missing interface cannot match the surviving interface's route.
+3. Includes the requested output interface in **IPv6** route matching, following
+   Talos `RouteID` identity. Cleanup for a missing interface cannot match the
+   surviving interface's IPv6 route. IPv4 matching remains independent of the
+   interface so a running spec can delete its old-link route and install its
+   replacement on another link.
 4. Treats only `ESRCH` from deletion as successful cleanup. Other errors still
    propagate; the patch does not suppress arbitrary `EEXIST` errors.
 
 Metric 100 is a deliberate routing-policy choice for this fabric. Upstream
 review should decide whether it should be the general default or configurable,
 and whether to split that policy change from the controller corrections.
-The existing route-controller suite passes with the patch.
+The existing route-controller suite passes with the patch. The RA control
+runs through that controller with an explicit priority of 100, showing that
+the metric choice alone resolves the coexistence case.
+
+Review of the first patch found an IPv4 regression: filtering every family by
+interface prevented replacement of an existing IPv4 route after its output
+link changed. The new `IPv4LinkMove` test passes on stock, fails on the first
+patch with `EEXIST`, and must pass on the corrected patch. `IPv4MetricControl`
+also rejects the first patch's unintended IPv4 metric change. These controls
+remain mandatory in both `repro` and `fix`.
 
 ## Reproduce and verify with Nix
 
@@ -104,7 +119,7 @@ nix flake check -L
 ```
 
 **A successful `repro` build means the expected bugs were reproduced.** The
-stock test process must exit 1, the control must pass, and exactly the five
+stock test process must exit 1, all three controls must pass, and exactly the five
 specified subtests must fail with their expected diagnostics. Compiler errors,
 skips, panics, setup failures and unrelated assertions do not count. The
 [output validator](check-result.py) checks the exit status, exact subtest results
@@ -114,14 +129,14 @@ valid logs and malformed, skipped, unrelated or incomplete results.
 Expected `repro` result:
 
 ```text
-REPRODUCED: RA collision, add-before-withdrawal, wrong-interface cleanup and stale deletion; control passed.
+REPRODUCED: RA collision, add-before-withdrawal, wrong-interface cleanup and stale deletion; three controls passed.
 ```
 
-The `fix` output requires all six common regression cases and all eight existing
+The `fix` output requires all eight common regression cases and all eight existing
 `TestRouteSpecSuite` cases to pass:
 
 ```text
-PASS: all six route regressions and eight existing route-controller tests passed.
+PASS: all eight route regressions and eight existing route-controller tests passed.
 ```
 
 Both builds also run Talos's existing internal BGP unit tests. Outputs retain
@@ -143,11 +158,11 @@ nix build .#fix-tests -o fixed-tests
 # Record this before entering the disposable namespace.
 export TALOS_ROUTE_REPRO_PARENT_NETNS="$(readlink /proc/self/ns/net)"
 
-# Expected exit 1: control passes; the five defect cases fail.
+# Expected exit 1: three controls pass; the five defect cases fail.
 unshare --user --map-root-user --net env TALOS_ROUTE_REPRO_NETNS=1 \
   ./stock-tests/bin/route-tests -test.run '^TestRouteRegression$' -test.v
 
-# Expected exit 0: all six pass.
+# Expected exit 0: all eight pass.
 unshare --user --map-root-user --net env TALOS_ROUTE_REPRO_NETNS=1 \
   ./fixed-tests/bin/route-tests -test.run '^TestRouteRegression$' -test.v
 ```
@@ -187,7 +202,7 @@ labelled `proto ra`; it does not emulate an RA daemon. The standalone VM is
 NixOS running a Talos test binary, not a booted Talos cluster. No SONiC or BGP
 session is needed to reproduce these controller defects.
 
-Separately, the same implementation patch was included in custom Talos
+Separately, the **earlier patch**, before the IPv4 correction, was included in custom Talos
 `1.14.1-sokk.3` and qualified in a KVM fabric containing two routers, two SONiC
 VS switches, three control planes and three workers. All **41 cases passed**:
 six upgrades from the original baseline, the full fault matrix on the patched
@@ -197,7 +212,10 @@ took 15.1 seconds in total. The longest sampled ingress outage across that run
 was 12.1 seconds, within the unchanged 30-second budget. Inspected candidate
 logs contained no route-controller failures.
 
-That cluster result is supporting evidence, not a test run by this flake.
+That historical cluster result did not cover IPv4 route moves and does not
+qualify the corrected patch. It is supporting evidence, not a test run by this
+flake. The corrected SOKK candidate is `1.14.1-sokk.4`; its full fabric
+qualification is tracked separately.
 Physical switch ASIC behavior and different Talos versions remain outside this
 reproduction. No upstream report or pull request has been submitted by this
 project's preparation.

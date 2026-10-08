@@ -1,16 +1,18 @@
 --- a/internal/app/machined/pkg/controllers/network/internal/bgp/bgp.go
 +++ b/internal/app/machined/pkg/controllers/network/internal/bgp/bgp.go
-@@ -270,6 +270,10 @@
- 		Destination: prefix,
- 		Table:       table,
- 		Protocol:    nethelpers.ProtocolBGP,
-+		// Keep learned routes separate from RA defaults (IPv6 metric 1024).
-+		// A zero metric is normalized to 1024 by Linux and exclusive inserts
-+		// then collide with an RA route through another interface.
-+		Priority:    100,
+@@ -273,6 +273,12 @@
  		Type:        nethelpers.TypeUnicast,
  		Scope:       nethelpers.ScopeGlobal,
  		ConfigLayer: network.ConfigOperator,
++	}
++
++	if spec.Family == nethelpers.FamilyInet6 {
++		// Linux normalizes an IPv6 metric of zero to 1024. Keep BGP defaults
++		// distinct from RA defaults at that metric, preserving RA fallback.
++		spec.Priority = 100
+ 	}
+ 
+ 	if source.IsValid() && source.Is4() == prefix.Addr().Is4() {
 --- a/internal/app/machined/pkg/controllers/network/route_spec.go
 +++ b/internal/app/machined/pkg/controllers/network/route_spec.go
 @@ -6,6 +6,7 @@
@@ -26,7 +28,7 @@
  		}
  
 -		// list rtnetlink routes
-+		var specs []*network.RouteSpec
++		specs := make([]*network.RouteSpec, 0, list.Len())
 +		for route := range list.All() {
 +			specs = append(specs, route)
 +		}
@@ -90,9 +92,9 @@
  	var result []*rtnetlink.RouteMessage //nolint:prealloc
  
  	for i, route := range existingRoutes {
-+		// Link-local gateways can be identical on independent interfaces.
-+		// Each RouteSpec owns only the next-hop on its requested link.
-+		if expected.OutLinkName != "" && route.Attributes.OutIface != linkIndex {
++		// Match RouteID: only IPv6 includes the output link in resource identity.
++		// IPv4 must still match an old-link route so syncRoute can move it.
++		if expected.Family == nethelpers.FamilyInet6 && expected.OutLinkName != "" && route.Attributes.OutIface != linkIndex {
 +			continue
 +		}
 +

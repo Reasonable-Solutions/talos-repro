@@ -7,10 +7,10 @@ mode, directory = sys.argv[1:]
 root = Path(directory)
 log = (root / "regression.log").read_text()
 status = int((root / "exit-code").read_text())
-cases = ["RAControl", "BGPBesideRA", "NextHopReplacement", "InterfaceOwnership",
+cases = ["RAControl", "IPv4MetricControl", "IPv4LinkMove", "BGPBesideRA", "NextHopReplacement", "InterfaceOwnership",
          "MissingInterfaceOwnership", "IdempotentDelete"]
 observed = re.findall(r"^    --- (PASS|FAIL|SKIP): TestRouteRegression/(\w+) ", log, re.M)
-expected = [("PASS" if mode == "fix" or name == "RAControl" else "FAIL", name) for name in cases]
+expected = [("PASS" if mode == "fix" or name in {"RAControl", "IPv4MetricControl", "IPv4LinkMove"} else "FAIL", name) for name in cases]
 assert observed == expected, f"Unexpected subtest results: {observed}\n{log}"
 assert status == (0 if mode == "fix" else 1), f"Unexpected exit status {status}\n{log}"
 assert "Error Trace:" not in log and "panic:" not in log, log
@@ -22,6 +22,6 @@ if mode == "fix":
     upstream = (root / "upstream-tests.log").read_text()
     assert "--- PASS: TestRouteSpecSuite " in upstream and "--- FAIL:" not in upstream, upstream
     assert len(re.findall(r"^    --- PASS: TestRouteSpecSuite/", upstream, re.M)) == 8, upstream
-    print("PASS: all six route regressions and eight existing route-controller tests passed.")
+    print("PASS: all eight route regressions and eight existing route-controller tests passed.")
 else:
-    print("REPRODUCED: RA collision, add-before-withdrawal, wrong-interface cleanup and stale deletion; control passed.")
+    print("REPRODUCED: RA collision, add-before-withdrawal, wrong-interface cleanup and stale deletion; three controls passed.")

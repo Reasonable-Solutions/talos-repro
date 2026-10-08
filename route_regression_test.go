@@ -130,9 +130,40 @@ func TestRouteRegression(t *testing.T) {
 	t.Run("RAControl", func(t *testing.T) {
 		f := newRouteFixture(t)
 		f.add(t, unix.RTPROT_RA, f.indices[1], 1024, "fe80::1")
-		f.add(t, unix.RTPROT_BGP, f.indices[0], 100, "fe80::2")
+		bgp := learnedRoute("control", "repro0", "fe80::2")
+		bgp.TypedSpec().Priority = 100
+		require.NoError(t, runOnce(bgp))
 		require.Equal(t, 1, f.count(t, unix.RTPROT_RA, f.indices[1]))
 		require.Equal(t, 1, f.count(t, unix.RTPROT_BGP, f.indices[0]))
+	})
+	t.Run("IPv4MetricControl", func(t *testing.T) {
+		spec := internalbgp.RouteSpec(netip.MustParsePrefix("0.0.0.0/0"), nil, netip.Addr{}, nethelpers.TableMain)
+		require.Zero(t, spec.Priority, "IPv6 RA policy must not change the IPv4 BGP metric")
+	})
+	t.Run("IPv4LinkMove", func(t *testing.T) {
+		f := newRouteFixture(t)
+		for _, index := range f.indices {
+			addr := net.ParseIP("10.0.0.2").To4()
+			require.NoError(t, f.conn.Address.New(&rtnetlink.AddressMessage{Family: unix.AF_INET, PrefixLength: 24, Index: index,
+				Attributes: &rtnetlink.AddressAttributes{Address: addr, Local: addr}}))
+		}
+		spec := internalbgp.RouteSpec(netip.MustParsePrefix("0.0.0.0/0"),
+			[]network.RouteNextHop{{Gateway: netip.MustParseAddr("10.0.0.1"), OutLinkName: "repro0"}}, netip.Addr{}, nethelpers.TableMain)
+		// Isolate link matching from any change to the default BGP metric.
+		spec.Priority = 100
+		id := func(s network.RouteSpecSpec) string {
+			return network.RouteID(s.Table, s.Family, s.Destination, s.Gateway, s.Priority, s.OutLinkName)
+		}
+		route := network.NewRouteSpec(network.NamespaceName, id(spec))
+		*route.TypedSpec() = spec
+		require.NoError(t, runOnce(route))
+		require.Equal(t, 1, f.count(t, unix.RTPROT_BGP, f.indices[0]))
+		route.TypedSpec().OutLinkName = "repro1"
+		require.Equal(t, route.Metadata().ID(), id(*route.TypedSpec()), "IPv4 link changes retain resource identity")
+		require.NoError(t, runOnce(route), "replace the old-link IPv4 route before exclusive add")
+		require.Equal(t, 0, f.count(t, unix.RTPROT_BGP, f.indices[0]))
+		require.Equal(t, 1, f.count(t, unix.RTPROT_BGP, f.indices[1]))
+		require.NoError(t, runOnce(route), "reconciliation must stay idempotent after moving")
 	})
 	t.Run("BGPBesideRA", func(t *testing.T) {
 		f := newRouteFixture(t)

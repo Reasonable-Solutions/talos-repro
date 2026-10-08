@@ -11,10 +11,11 @@
       pkgs = nixpkgs.legacyPackages.${system};
       go = toolchain.legacyPackages.${system}.go;
       revision = "2f86b9d2a29b413deddd7122a8420b8913813615";
-      source = pkgs.fetchurl {
-        name = "talos-${revision}.tar.gz";
-        url = "https://api.github.com/repos/siderolabs/talos/tarball/${revision}";
-        hash = "sha256-Nb1VWFsCApOD5it7l3in+Uye8hbAZ+vWXlhKH+s6y1g=";
+      source = pkgs.fetchFromGitHub {
+        owner = "siderolabs";
+        repo = "talos";
+        rev = revision;
+        hash = "sha256-55BnNQAUxzUbtYjvMAM6ExnDPNyl7XN7pASYBeMWt3Y=";
       };
       mkBinary =
         patched:
@@ -76,7 +77,7 @@
               machine.start()
               machine.wait_for_unit("multi-user.target")
               parent_netns = machine.succeed("readlink /proc/self/ns/net").strip()
-              status, _ = machine.execute(f"unshare --net env TALOS_ROUTE_REPRO_NETNS=1 TALOS_ROUTE_REPRO_PARENT_NETNS={parent_netns} ${binary}/bin/route-tests -test.run '^TestRouteRegression$' -test.v > /tmp/regression.log 2>&1")
+              status, _ = machine.execute(f"unshare --net env TALOS_ROUTE_REPRO_NETNS=1 TALOS_ROUTE_REPRO_PARENT_NETNS='{parent_netns}' ${binary}/bin/route-tests -test.run '^TestRouteRegression$' -test.v > /tmp/regression.log 2>&1")
               machine.succeed(f"echo {status} > /tmp/exit-code")
               machine.copy_from_vm("/tmp/regression.log")
               machine.copy_from_vm("/tmp/exit-code")
