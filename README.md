@@ -202,20 +202,23 @@ labelled `proto ra`; it does not emulate an RA daemon. The standalone VM is
 NixOS running a Talos test binary, not a booted Talos cluster. No SONiC or BGP
 session is needed to reproduce these controller defects.
 
-Separately, the **earlier patch**, before the IPv4 correction, was included in custom Talos
-`1.14.1-sokk.3` and qualified in a KVM fabric containing two routers, two SONiC
+Separately, the corrected implementation patch was included in custom Talos
+`1.14.1-sokk.4` and qualified in a KVM fabric containing two routers, two SONiC
 VS switches, three control planes and three workers. All **41 cases passed**:
 six upgrades from the original baseline, the full fault matrix on the patched
 candidate, and six rollbacks with persistent data, configuration, identities,
-etcd quorum and running binary hashes checked. The cable move-and-return case
-took 15.1 seconds in total. The longest sampled ingress outage across that run
-was 12.1 seconds, within the unchanged 30-second budget. Inspected candidate
-logs contained no route-controller failures.
+etcd quorum and running binary hashes checked. Cable move-and-return took
+16.4 seconds; the longest sampled ingress outage was 16.2 seconds, within the
+unchanged 30-second budget. This cluster qualification is separate from the
+standalone flake.
 
-That historical cluster result did not cover IPv4 route moves and does not
-qualify the corrected patch. It is supporting evidence, not a test run by this
-flake. The corrected SOKK candidate is `1.14.1-sokk.4`; its full fabric
-qualification is tracked separately.
+Post-fault logs on one worker nevertheless contained **three transient IPv6 BGP
+`EEXIST` controller failures** at metric 100 during power recovery.
+Reconciliation recovered within the test budget. The resource/kernel ordering
+behind these remaining collisions has not yet been reproduced deterministically.
+The tests here cover the eight listed cases; they do **not** establish that all
+route-controller failures during asynchronous BGP churn are eliminated.
+
 Physical switch ASIC behavior and different Talos versions remain outside this
 reproduction. No upstream report or pull request has been submitted by this
 project's preparation.
