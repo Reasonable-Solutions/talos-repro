@@ -99,6 +99,10 @@
           cp ${./route-reconciliation.patch} $out/route-reconciliation.patch
           ln -s ${binary}/bin/route-tests $out/bin/route-tests
         '';
+      upstream = import ./upstream-evaluation.nix {
+        inherit pkgs;
+        stockBinary = mkBinary false;
+      };
       cases = {
         repro = mkCase false;
         fix = mkCase true;
@@ -107,11 +111,14 @@
     assert go.version == "1.26.5";
     {
       packages.${system} = cases // {
+        upstream-evaluation = upstream.result;
+        upstream-tests = upstream.tests;
         default = cases.fix;
         repro-tests = mkBinary false;
         fix-tests = mkBinary true;
       };
       checks.${system} = cases // {
+        upstream-evaluation = upstream.result;
         validator =
           pkgs.runCommand "talos-route-validator-check" { nativeBuildInputs = [ pkgs.python3 ]; }
             ''

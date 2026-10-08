@@ -13,7 +13,8 @@ a real Linux kernel in a small NixOS VM.
 Pinned source: **Talos 1.14.1**, commit
 [`2f86b9d2a29b413deddd7122a8420b8913813615`](https://github.com/siderolabs/talos/tree/2f86b9d2a29b413deddd7122a8420b8913813615).
 The flake pins the unpacked source tree, vendored dependencies, Go **1.26.5**, and the
-NixOS test environment. Other Talos versions have not been evaluated here.
+NixOS test environment. The separate upstream evaluation below is a backport experiment, not a
+qualification of another Talos release.
 
 ## Why we are fixing this
 
@@ -98,6 +99,60 @@ link changed. The new `IPv4LinkMove` test passes on stock, fails on the first
 patch with `EEXIST`, and must pass on the corrected patch. `IPv4MetricControl`
 also rejects the first patch's unintended IPv4 metric change. These controls
 remain mandatory in both `repro` and `fix`.
+
+## Upstream route rework evaluation
+
+[PR #14548](https://github.com/siderolabs/talos/pull/14548), merged as
+[`3663614ba772f02acce10ed0d06405d48e8f5b2d`](https://github.com/siderolabs/talos/commit/3663614ba772f02acce10ed0d06405d48e8f5b2d),
+changes route-spec identity to table/family/destination/metric and replaces
+owned kernel routes atomically. It addresses next-hop transitions, but does
+not by itself replace this project's fix for our fabric.
+
+```sh
+nix build .#upstream-evaluation -o result-upstream -L
+cat result-upstream/result
+cat result-upstream/regression.log
+cat result-upstream/upstream-tests.log
+```
+
+This output succeeds only when the comparison reproduces the two remaining
+failures and the route/merge suites pass. It is **not a successful-fix or
+promotion gate**. `repro`, `fix`, and the existing qualified `.4` candidate
+remain unchanged.
+
+| Behavior in the experimental backport | Result |
+| --- | --- |
+| BGP with explicit metric 100 beside RA | Pass |
+| IPv4 BGP metric remains zero | Pass |
+| IPv4 link migration | Pass |
+| Default learned IPv6 BGP route beside RA | **EEXIST remains** |
+| Next-hop update through a stable spec | Pass |
+| Teardown preserves a foreign protocol, with present or missing link | Both pass |
+| Deletion after the kernel route has already disappeared | **ESRCH remains** |
+
+The adapted test uses stable route identity for next-hop changes. The original
+interface-ownership fixtures assume different specs can own the same kernel
+key on different links; that no longer describes the upstream model. Instead,
+the comparison checks foreign-protocol preservation, while the upstream merge
+suite checks same-key conflicts. The 14 upstream route-controller cases and
+three merge cases also pass, including IPv4/IPv6 next-hop changes in place.
+
+Scope: [upstream-route-backport.patch](upstream-route-backport.patch) applies
+#14548's implementation and tests to our pinned 1.14.1 source and dependencies;
+this is **not a build of upstream `main` or a released 1.15 image**. The release
+note is omitted. The route controller is copied verbatim from the merged
+commit, including its prerequisite route matching, cross-family gateway and
+next-hop normalization changes. The machinery `route_spec.go` also includes
+the upstream normalization prerequisite. The route test suite retains the
+1.14-compatible embedded `DefaultSuite` initializer. Other hunks are rebased
+onto 1.14.1. The build updates the vendored machinery copy as well as its
+source, so tests exercise the new `RouteID` implementation.
+
+This isolated kernel evaluation does not establish that the rework eliminates
+the transient IPv6 EEXIST seen during fabric power recovery. It failed the
+standalone replacement gate, so no fabric rollout or promotion was performed.
+A combined candidate would still need the IPv6 metric policy and idempotent
+deletion behavior, followed by full fabric fault and upgrade qualification.
 
 ## Reproduce and verify with Nix
 
