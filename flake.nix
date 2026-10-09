@@ -60,7 +60,7 @@
           binary = mkBinary patched;
           upstreamRunner = pkgs.writeShellScript "route-upstream-tests" ''
             ${pkgs.iproute2}/bin/ip link set lo up
-            exec ${binary}/bin/route-tests -test.run '^TestRouteSpecSuite$' -test.v
+            exec ${binary}/bin/route-tests -test.run '^(TestRouteSpecSuite|TestRouteMergeSuite)$' -test.v
           '';
           vm = pkgs.testers.runNixOSTest {
             name = "talos-route-${name}";
@@ -81,6 +81,10 @@
               machine.succeed(f"echo {status} > /tmp/exit-code")
               machine.copy_from_vm("/tmp/regression.log")
               machine.copy_from_vm("/tmp/exit-code")
+              merge_status, _ = machine.execute("${binary}/bin/route-tests -test.run '^TestRouteMergeCollisionSuite$' -test.v > /tmp/merge.log 2>&1")
+              machine.succeed(f"echo {merge_status} > /tmp/merge-exit-code")
+              machine.copy_from_vm("/tmp/merge.log")
+              machine.copy_from_vm("/tmp/merge-exit-code")
               ${pkgs.lib.optionalString patched ''
                 machine.succeed("unshare --net ${upstreamRunner} > /tmp/upstream-tests.log 2>&1")
                 machine.copy_from_vm("/tmp/upstream-tests.log")
@@ -90,7 +94,7 @@
         in
         pkgs.runCommand "talos-route-${name}" { nativeBuildInputs = [ pkgs.python3 ]; } ''
           mkdir -p $out/bin
-          cp ${vm}/regression.log ${vm}/exit-code $out/
+          cp ${vm}/regression.log ${vm}/exit-code ${vm}/merge.log ${vm}/merge-exit-code $out/
           ${pkgs.lib.optionalString patched "cp ${vm}/upstream-tests.log $out/"}
           cp ${binary}/source-tests.log $out/
           python ${./check-result.py} ${name} $out > $out/result

@@ -10,8 +10,10 @@ for mode, original in (("repro", repro), ("fix", fixed)):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         originals = {name: (original / name).read_text() for name in
-                     ("regression.log", "exit-code", *(["upstream-tests.log"] if mode == "fix" else []))}
-        mutations = [None, "compiler", "status", "skip", "extra", "assertion", "ipv4-move", "ipv4-metric"]
+                     ("regression.log", "exit-code", "merge.log", "merge-exit-code",
+                      *(["upstream-tests.log"] if mode == "fix" else []))}
+        mutations = [None, "compiler", "status", "skip", "extra", "assertion", "ipv4-move", "ipv4-metric",
+                     "merge-status", "merge-result"]
         mutations += ["missing-marker", "control"] if mode == "repro" else ["missing-upstream"]
         for mutation in mutations:
             data = dict(originals)
@@ -29,6 +31,12 @@ for mode, original in (("repro", repro), ("fix", fixed)):
             elif mutation in ("ipv4-move", "ipv4-metric"):
                 case = "IPv4LinkMove" if mutation == "ipv4-move" else "IPv4MetricControl"
                 data["regression.log"] = log.replace(f"--- PASS: TestRouteRegression/{case}", f"--- FAIL: TestRouteRegression/{case}")
+            elif mutation == "merge-status":
+                data["merge-exit-code"] = "2\n"
+            elif mutation == "merge-result":
+                expected = "PASS" if mode == "fix" else "FAIL"
+                data["merge.log"] = data["merge.log"].replace(
+                    f"--- {expected}: TestRouteMergeCollisionSuite", "--- SKIP: TestRouteMergeCollisionSuite")
             elif mutation == "missing-marker":
                 data["regression.log"] = log.replace("REPRO_RA_BGP_COLLISION:", "OTHER:")
             elif mutation == "control":

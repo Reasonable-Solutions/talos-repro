@@ -1,18 +1,18 @@
 --- a/internal/app/machined/pkg/controllers/network/internal/bgp/bgp.go
 +++ b/internal/app/machined/pkg/controllers/network/internal/bgp/bgp.go
-@@ -273,6 +273,12 @@
- 		Type:        nethelpers.TypeUnicast,
- 		Scope:       nethelpers.ScopeGlobal,
+@@ -275,6 +275,12 @@
  		ConfigLayer: network.ConfigOperator,
-+	}
-+
+ 	}
+ 
 +	if spec.Family == nethelpers.FamilyInet6 {
 +		// Linux normalizes an IPv6 metric of zero to 1024. Keep BGP defaults
 +		// distinct from RA defaults at that metric, preserving RA fallback.
 +		spec.Priority = 100
- 	}
- 
++	}
++
  	if source.IsValid() && source.Is4() == prefix.Addr().Is4() {
+ 		spec.Source = source
+ 	}
 --- a/internal/app/machined/pkg/controllers/network/route_spec.go
 +++ b/internal/app/machined/pkg/controllers/network/route_spec.go
 @@ -6,6 +6,7 @@
@@ -52,20 +52,17 @@
  		routes, err := conn.Route.List()
  		if err != nil {
 -			return fmt.Errorf("error listing addresses: %w", err)
--		}
--
--		var multiErr *multierror.Error
--
--		// loop over routes and make reconcile decision
--		for route := range list.All() {
 +			return fmt.Errorf("error listing routes: %w", err)
-+		}
-+
+ 		}
+ 
+-		var multiErr *multierror.Error
 +		for _, route := range specs {
 +			if route.Metadata().Phase() != phase {
 +				continue
 +			}
-+
+ 
+-		// loop over routes and make reconcile decision
+-		for route := range list.All() {
  			if err = ctrl.syncRoute(ctx, r, logger, conn, links, routes, route); err != nil {
  				multiErr = multierror.Append(multiErr, err)
  			}
@@ -76,8 +73,7 @@
 -		}
 -
 -		r.ResetRestartBackoff()
--	}
-+	}
+ 	}
 +
 +	return multiErr.ErrorOrNil()
  }
@@ -88,41 +84,57 @@
  }
  
 -func findMatchingRoutes(existingRoutes []rtnetlink.RouteMessage, expected *network.RouteSpecSpec) []*rtnetlink.RouteMessage {
-+func findMatchingRoutes(existingRoutes []rtnetlink.RouteMessage, expected *network.RouteSpecSpec, linkIndex uint32) []*rtnetlink.RouteMessage {
++func findMatchingRoutes(existingRoutes []rtnetlink.RouteMessage, expected *network.RouteSpecSpec, linkIndex uint32, matchLink bool) []*rtnetlink.RouteMessage {
  	var result []*rtnetlink.RouteMessage //nolint:prealloc
  
  	for i, route := range existingRoutes {
 +		// Match RouteID: only IPv6 includes the output link in resource identity.
 +		// IPv4 must still match an old-link route so syncRoute can move it.
-+		if expected.Family == nethelpers.FamilyInet6 && expected.OutLinkName != "" && route.Attributes.OutIface != linkIndex {
++		if matchLink && expected.Family == nethelpers.FamilyInet6 && expected.OutLinkName != "" && route.Attributes.OutIface != linkIndex {
 +			continue
 +		}
 +
  		if route.Family != uint8(expected.Family) {
  			continue
  		}
-@@ -320,9 +344,9 @@
+@@ -175,7 +199,14 @@
+ 			continue
+ 		}
+ 
+-		if !routeGatewayMatches(&existingRoutes[i], expected) {
++		if matchLink {
++			if !routeGatewayMatches(&existingRoutes[i], expected) {
++				continue
++			}
++		} else if route.Protocol != uint8(expected.Protocol) && !routeGatewayMatches(&existingRoutes[i], expected) {
++			// A running spec owns previous next-hops of the same protocol and
++			// exact-gateway routes whose protocol is changing in place. Leave
++			// unrelated kernel routes alone so their collision remains visible.
+ 			continue
+ 		}
+ 
+@@ -320,9 +351,9 @@
  
  	switch route.Metadata().Phase() {
  	case resource.PhaseTearingDown:
 -		for _, existing := range findMatchingRoutes(routes, route.TypedSpec()) {
-+		for _, existing := range findMatchingRoutes(routes, route.TypedSpec(), linkIndex) {
++		for _, existing := range findMatchingRoutes(routes, route.TypedSpec(), linkIndex, true) {
  			// delete route
 -			if err := conn.Route.Delete(existing); err != nil {
 +			if err := conn.Route.Delete(existing); err != nil && !errors.Is(err, unix.ESRCH) {
  				return fmt.Errorf("error removing route: %w", err)
  			}
  
-@@ -361,7 +385,7 @@
+@@ -361,7 +392,7 @@
  
  		matchFound := false
  
 -		for _, existing := range findMatchingRoutes(routes, route.TypedSpec()) {
-+		for _, existing := range findMatchingRoutes(routes, route.TypedSpec(), linkIndex) {
++		for _, existing := range findMatchingRoutes(routes, route.TypedSpec(), linkIndex, false) {
  			var existingMTU uint32
  
  			if existing.Attributes.Metrics != nil {
-@@ -384,7 +408,7 @@
+@@ -384,7 +415,7 @@
  			}
  
  			// delete the route, it doesn't match the spec
@@ -131,3 +143,68 @@
  				return fmt.Errorf("error removing route: %w", err)
  			}
  
+--- a/internal/app/machined/pkg/controllers/network/route_merge.go
++++ b/internal/app/machined/pkg/controllers/network/route_merge.go
+@@ -5,6 +5,8 @@
+ package network
+ 
+ import (
++	"net/netip"
++
+ 	"github.com/cosi-project/runtime/pkg/controller"
+ 	"github.com/cosi-project/runtime/pkg/resource"
+ 	"github.com/cosi-project/runtime/pkg/safe"
+@@ -21,19 +23,45 @@
+ 		network.ConfigNamespaceName,
+ 		network.NamespaceName,
+ 		func(logger *zap.Logger, list safe.List[*network.RouteSpec]) map[resource.ID]*network.RouteSpecSpec {
+-			// route is allowed as long as it's not duplicate, for duplicate higher layer takes precedence
+-			routes := map[string]*network.RouteSpecSpec{}
++			// The Linux route key excludes gateway and output interface. Collapse
++			// transiently overlapping producer resources before they reach netlink.
++			selected := map[string]*network.RouteSpec{}
+ 
+ 			for route := range list.All() {
+-				id := network.RouteID(route.TypedSpec().Table, route.TypedSpec().Family, route.TypedSpec().Destination, route.TypedSpec().Gateway, route.TypedSpec().Priority, route.TypedSpec().OutLinkName)
++				key := network.RouteID(route.TypedSpec().Table, route.TypedSpec().Family, route.TypedSpec().Destination, netip.Addr{}, route.TypedSpec().Priority, "")
+ 
+-				existing, ok := routes[id]
+-				if ok && existing.ConfigLayer > route.TypedSpec().ConfigLayer {
+-					// skip this route, as existing one is higher layer
+-					continue
++				existing, ok := selected[key]
++				if ok {
++					candidateWins := route.TypedSpec().ConfigLayer > existing.TypedSpec().ConfigLayer ||
++						(route.TypedSpec().ConfigLayer == existing.TypedSpec().ConfigLayer &&
++							(route.Metadata().Updated().After(existing.Metadata().Updated()) ||
++								(route.Metadata().Updated().Equal(existing.Metadata().Updated()) && route.Metadata().ID() > existing.Metadata().ID())))
++					kept, dropped := existing, route
++
++					if candidateWins {
++						kept, dropped = route, existing
++					}
++
++					if route.TypedSpec().ConfigLayer == existing.TypedSpec().ConfigLayer {
++						logger.Warn("conflicting same-layer routes with the same kernel key, keeping the preferred route",
++							zap.String("key", key), zap.String("kept", kept.Metadata().ID()),
++							zap.String("dropped", dropped.Metadata().ID()))
++					}
++
++					if !candidateWins {
++						continue
++					}
+ 				}
+ 
+-				routes[id] = route.TypedSpec()
++				selected[key] = route
++			}
++
++			routes := make(map[resource.ID]*network.RouteSpecSpec, len(selected))
++
++			for _, route := range selected {
++				spec := route.TypedSpec()
++				id := network.RouteID(spec.Table, spec.Family, spec.Destination, spec.Gateway, spec.Priority, spec.OutLinkName)
++				routes[id] = spec
+ 			}
+ 
+ 			return routes

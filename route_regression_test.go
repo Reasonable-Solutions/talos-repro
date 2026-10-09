@@ -17,14 +17,64 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/jsimonetti/rtnetlink/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
+	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	internalbgp "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network/internal/bgp"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 )
+
+type routeMergeCollisionSuite struct {
+	ctest.DefaultSuite
+}
+
+func (suite *routeMergeCollisionSuite) TestNewestNextHopWinsOneKernelKey() {
+	old := network.NewRouteSpec(network.ConfigNamespaceName, "bgp/fabric/old")
+	*old.TypedSpec() = internalbgp.RouteSpec(netip.MustParsePrefix("2001:db8:1::/64"),
+		[]network.RouteNextHop{{Gateway: netip.MustParseAddr("fe80::1"), OutLinkName: "repro0"}}, netip.Addr{}, nethelpers.TableMain)
+	old.TypedSpec().Priority = 100
+	old.Metadata().SetUpdated(time.Unix(1, 0))
+
+	next := network.NewRouteSpec(network.ConfigNamespaceName, "bgp/fabric/new")
+	*next.TypedSpec() = internalbgp.RouteSpec(netip.MustParsePrefix("2001:db8:1::/64"),
+		[]network.RouteNextHop{{Gateway: netip.MustParseAddr("fe80::2"), OutLinkName: "repro1"}}, netip.Addr{}, nethelpers.TableMain)
+	next.TypedSpec().Priority = 100
+	next.Metadata().SetUpdated(time.Unix(2, 0))
+
+	oldID := network.RouteID(old.TypedSpec().Table, old.TypedSpec().Family, old.TypedSpec().Destination,
+		old.TypedSpec().Gateway, old.TypedSpec().Priority, old.TypedSpec().OutLinkName)
+	newID := network.RouteID(next.TypedSpec().Table, next.TypedSpec().Family, next.TypedSpec().Destination,
+		next.TypedSpec().Gateway, next.TypedSpec().Priority, next.TypedSpec().OutLinkName)
+
+	// Establish the old output before introducing an overlapping producer.
+	// The IDs iterate new before old, so selection still has to use Updated.
+	suite.Create(old)
+	ctest.AssertResource[*network.RouteSpec](suite, oldID, func(route *network.RouteSpec, asrt *assert.Assertions) {
+		asrt.Equal(*old.TypedSpec(), *route.TypedSpec())
+	})
+	suite.Create(next)
+
+	ctest.AssertResource[*network.RouteSpec](suite, newID, func(route *network.RouteSpec, asrt *assert.Assertions) {
+		asrt.Equal(*next.TypedSpec(), *route.TypedSpec())
+	})
+	ctest.AssertNoResource[*network.RouteSpec](suite, oldID)
+}
+
+func TestRouteMergeCollisionSuite(t *testing.T) {
+	t.Parallel()
+
+	suite.Run(t, &routeMergeCollisionSuite{DefaultSuite: ctest.DefaultSuite{
+		Timeout: 5 * time.Second,
+		AfterSetup: func(s *ctest.DefaultSuite) {
+			s.Require().NoError(s.Runtime().RegisterController(NewRouteMergeController()))
+		},
+	}})
+}
 
 // Feed a deterministic resource ordering into one real controller iteration.
 // Only the resource store/event source is stubbed: netlink uses the real kernel.
@@ -188,6 +238,22 @@ func TestRouteRegression(t *testing.T) {
 		err := runOnce(next, old) // new first is a valid resource-list order
 		if errors.Is(err, unix.EEXIST) {
 			t.Error("REPRO_ADD_BEFORE_WITHDRAWAL: replacement is attempted before withdrawn next-hop removal")
+			return
+		}
+		require.NoError(t, err)
+		require.Equal(t, 0, f.count(t, unix.RTPROT_BGP, f.indices[0]))
+		require.Equal(t, 1, f.count(t, unix.RTPROT_BGP, f.indices[1]))
+	})
+	t.Run("MergedNextHopChange", func(t *testing.T) {
+		f := newRouteFixture(t)
+		route := learnedRoute("stable-kernel-key", "repro0", "fe80::2")
+		route.TypedSpec().Priority = 100
+		require.NoError(t, runOnce(route))
+		route.TypedSpec().Gateway = netip.MustParseAddr("fe80::1")
+		route.TypedSpec().OutLinkName = "repro1"
+		err := runOnce(route)
+		if errors.Is(err, unix.EEXIST) {
+			t.Error("REPRO_MERGED_NEXT_HOP: a stable merged route cannot replace its old next-hop")
 			return
 		}
 		require.NoError(t, err)
