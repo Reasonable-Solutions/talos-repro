@@ -273,24 +273,26 @@ labelled `proto ra`; it does not emulate an RA daemon. The standalone VM is
 NixOS running a Talos test binary, not a booted Talos cluster. No SONiC or BGP
 session is needed to reproduce these controller defects.
 
-Separately, the corrected implementation patch was included in custom Talos
+The earlier corrected implementation was included in custom Talos
 `1.14.1-sokk.4` and qualified in a KVM fabric containing two routers, two SONiC
 VS switches, three control planes, three workers and three storage nodes. All
-**53 cases passed**: nine upgrades from the original baseline, the full fault
-matrix on the patched candidate, and nine rollbacks with persistent data,
-configuration, identities,
-etcd quorum and running binary hashes checked. Cable move-and-return took
-16.4 seconds; the longest sampled ingress outage was 16.2 seconds, within the
-unchanged 30-second budget. This cluster qualification is separate from the
-standalone flake.
+53 cases passed, but post-fault logs on one worker contained three transient
+IPv6 BGP `EEXIST` controller failures at metric 100 during power recovery.
+`MergedNextHopChange` reproduces that remaining controller failure
+deterministically against the real kernel, and `TestRouteMergeCollisionSuite`
+reproduces the producer overlap that can feed it.
 
-Post-fault logs on one worker nevertheless contained **three transient IPv6 BGP
-`EEXIST` controller failures** at metric 100 during power recovery.
-Reconciliation recovered within the test budget. `MergedNextHopChange` now
-reproduces that remaining controller failure deterministically against the real
-kernel, and `TestRouteMergeCollisionSuite` reproduces the producer overlap that
-can feed it. The standalone tests establish the source-level fix; cluster fault
-qualification remains separate evidence.
+The patch in this repository was then built as `1.14.1-sokk.5` and passed a
+fresh **54/54** full-suite qualification in the same nine-node fabric: nine
+upgrades from `.1`, the complete candidate fault matrix, a new log gate across
+all nine candidate nodes, and nine rollbacks. The longest sampled ingress
+outage was 4.035 seconds against the unchanged 30-second budget. None of the
+nine retained `machined` logs contained a `RouteSpecController` `file exists`
+error. The qualified installer digest is
+`sha256:03ad7a60b73b3d3b95e26ccc1ddbc31830aa015145374da92bc96d8a312b4021`;
+the PID 1 SHA-256 is
+`542fd19f09607dd4cd14718bdffe8b0129717a0e6ba1084f9999d4ba25b9b32b`.
+This cluster qualification is separate from the standalone flake.
 
 Physical switch ASIC behavior and different Talos versions remain outside this
 reproduction. No upstream report or pull request has been submitted by this
